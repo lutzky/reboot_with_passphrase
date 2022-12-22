@@ -1,6 +1,6 @@
 use clap::Parser;
 use color_eyre::{
-    eyre::{eyre, Result},
+    eyre::{eyre, Context, Result},
     Help, SectionExt,
 };
 use std::{
@@ -40,7 +40,8 @@ fn main() -> Result<()> {
         return Err(eyre!("Must run as root"));
     }
 
-    let password_paths: Vec<PasswordPath> = filesystems_with_key_status()?
+    let password_paths: Vec<PasswordPath> = filesystems_with_key_status()
+        .wrap_err("failed to find encryption-enabled filesystems")?
         .into_iter()
         .filter_map(
             |filesystem| match get_password(&filesystem, args.skip_password_check) {
@@ -154,7 +155,8 @@ fn filesystems_with_key_status() -> Result<Vec<String>> {
 
     let output = Command::new("zfs")
         .args(["get", "-H", "-t", "filesystem", "keystatus"])
-        .output()?;
+        .output()
+        .wrap_err("failed to run zfs utility")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
