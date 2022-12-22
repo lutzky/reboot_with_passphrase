@@ -92,7 +92,7 @@ where
         writeln!(w, "zfs mount {}", pp.path)?;
     }
 
-    writeln!(w, "exec shred -u ")?;
+    writeln!(w, "exec shred -u $0")?;
 
     Ok(())
 }
