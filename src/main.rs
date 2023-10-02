@@ -3,6 +3,7 @@ use color_eyre::{
     eyre::{eyre, Context, Result},
     Help, SectionExt,
 };
+use itertools::Itertools;
 use std::{
     borrow::Cow,
     fs::OpenOptions,
@@ -58,22 +59,22 @@ fn main() -> Result<()> {
         .collect();
 
     if args.output_file.is_empty() {
-        write_reboot_script(stdout(), &password_paths)?;
+        write_reboot_script(&mut stdout(), &password_paths)?;
     } else {
-        let f = OpenOptions::new()
+        let mut f = OpenOptions::new()
             .mode(0o700)
             .write(true)
             .create(true)
             .truncate(true)
             .open(&args.output_file)?;
-        write_reboot_script(f, &password_paths)?;
+        write_reboot_script(&mut f, &password_paths)?;
         eprintln!("Wrote {}", &args.output_file);
     }
 
     Ok(())
 }
 
-fn write_reboot_script<W>(w: W, password_paths: &Vec<PasswordPath>) -> Result<()>
+fn write_reboot_script<W>(w: &mut W, password_paths: &Vec<PasswordPath>) -> Result<()>
 where
     W: Write,
 {
@@ -142,17 +143,6 @@ fn get_password(fs: &str, skip_password_check: bool) -> Option<String> {
 }
 
 fn filesystems_with_key_status() -> Result<Vec<String>> {
-    fn parse_line(line: &str) -> Result<Option<String>> {
-        let fields: Vec<_> = line.split_ascii_whitespace().collect();
-        match fields.get(2) {
-            Some(&"available") => match fields.first() {
-                Some(s) => Ok(Some(s.to_string())),
-                None => Err(eyre!("unparseable zfs line {:?}", line)),
-            },
-            Some(_) | None => Ok(None),
-        }
-    }
-
     let output = Command::new("zfs")
         .args(["get", "-H", "-t", "filesystem", "keystatus"])
         .output()
@@ -164,19 +154,84 @@ fn filesystems_with_key_status() -> Result<Vec<String>> {
             .with_section(move || stderr.trim().to_string().header("Stderr:"));
     }
 
-    output
-        .stdout
+    parse_filesystems_with_key_status(output.stdout)
+        .wrap_err("failed to parse filesystems with key status")
+}
+
+fn parse_filesystems_with_key_status(
+    zfs_get_output: Vec<u8>,
+) -> Result<Vec<String>, std::io::Error> {
+    fn parse_line(line: &str) -> Option<String> {
+        let fields: Vec<_> = line.split_ascii_whitespace().collect();
+        match fields.get(2) {
+            Some(&"available") => Some(
+                fields
+                    .first()
+                    .unwrap_or_else(|| {
+                        unreachable!("fields.get(2) worked and fields.first() failed")
+                    })
+                    .to_string(),
+            ),
+            Some(_) | None => None,
+        }
+    }
+
+    zfs_get_output
         .lines()
-        .map(|maybe_line| -> Result<Option<String>> {
-            match maybe_line {
-                Ok(line) => parse_line(&line),
-                Err(e) => Err(e.into()),
-            }
-        })
-        .filter_map(|maybe_line_result| match maybe_line_result {
-            Ok(Some(s)) => Some(Ok(s)),
-            Ok(None) => None,
-            Err(e) => Some(Err(e)),
-        })
+        .filter_map_ok(|l| parse_line(&l))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn test_write_reboot_script() {
+        let mut buf = std::io::BufWriter::new(Vec::new());
+        write_reboot_script(
+            &mut buf,
+            &vec![
+                PasswordPath {
+                    path: "some_path".to_owned(),
+                    password: "hunter1".to_owned(),
+                },
+                PasswordPath {
+                    path: "other_path".to_owned(),
+                    password: "hunter2".to_owned(),
+                },
+            ],
+        )
+        .unwrap();
+        let bytes = buf.into_inner().unwrap();
+
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            indoc! {"
+                #!/bin/bash
+                echo hunter1 | zfs load-key some_path
+                echo hunter2 | zfs load-key other_path
+                zfs mount some_path
+                zfs mount other_path
+                exec shred -u $0
+            "}
+        );
+    }
+
+    #[test]
+    fn parse_filesystems_with_key_status_valid() {
+        let zfs_output = indoc! {"
+            tank\tkeystatus\t-\t-
+            tank/decrypted_fs1\tkeystatus\t-\t-
+            tank/encrypted_fs1\tkeystatus\tavailable\t-
+            tank/decrypted_fs2\tkeystatus\t-\t-
+            tank/encrypted_fs2\tkeystatus\tavailable\t-
+        "};
+
+        let got = parse_filesystems_with_key_status(zfs_output.into()).unwrap();
+
+        assert_eq!(got, vec!["tank/encrypted_fs1", "tank/encrypted_fs2"]);
+    }
 }
